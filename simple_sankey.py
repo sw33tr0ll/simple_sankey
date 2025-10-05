@@ -823,10 +823,6 @@ def main():
 
         return category_totals, sankey_data
 
-    # Create placeholders for dynamic updates
-    sankey_placeholder = st.empty()
-    category_summary_placeholder = st.empty()
-
     def display_sankey(category_totals, sankey_data, expenses, stream_update=None):
         """Display or update the Sankey diagram."""
         # Apply any existing modifications and rebuild
@@ -841,9 +837,9 @@ def main():
         labels_with_values = [sankey_data['labels'][0]]  # Income node
         for i, label in enumerate(sankey_data['labels'][1:], 1):
             # Find total value for this node by summing all links targeting it
-            node_value = sum(val for src, tgt, val in zip(sankey_data['sources'], sankey_data['targets'], sankey_data['values']) if tgt == i)
+            node_value = sum(val for _src, tgt, val in zip(sankey_data['sources'], sankey_data['targets'], sankey_data['values']) if tgt == i)
             if node_value == 0:  # If it's only a source, use outgoing value
-                node_value = sum(val for src, tgt, val in zip(sankey_data['sources'], sankey_data['targets'], sankey_data['values']) if src == i)
+                node_value = sum(val for src, _tgt, val in zip(sankey_data['sources'], sankey_data['targets'], sankey_data['values']) if src == i)
             labels_with_values.append(f"{label}<br>${node_value:,.0f}")
 
         fig = go.Figure(
@@ -874,36 +870,14 @@ def main():
 
         # Use stream_update counter for unique keys during streaming, otherwise use id
         chart_key = f"sankey_stream_{stream_update}" if stream_update is not None else f"sankey_{id(category_totals)}"
-        sankey_placeholder.plotly_chart(fig, use_container_width=True, key=chart_key)
+        st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
-        # Update category summary
-        with category_summary_placeholder.container():
-            st.write("### Spending by Category")
-            for _, row in category_totals.iterrows():
-                st.write(f"**{row['Category']}**: ${row['Amount']:,.2f}")
+        # Display category summary
+        st.write("### Spending by Category")
+        for _, row in category_totals.iterrows():
+            st.write(f"**{row['Category']}**: ${row['Amount']:,.2f}")
 
-    # Process full dataset with GPT-5 only if not already done
-    if st.session_state.processed_expenses is None:
-        # Process data with callbacks for initial state and live updates
-        category_totals, sankey_data, expenses = prepare_sankey_data(
-            df,
-            use_gpt5=True,
-            api_key=api_key,
-            display_callback=display_sankey,
-            update_callback=display_sankey  # Same callback for live updates
-        )
-
-        if category_totals.empty:
-            st.error("No expenses found! Check your CSV format.")
-            return
-
-        # Store processed expenses in session state
-        st.session_state.processed_expenses = expenses
-    else:
-        # Use cached processed expenses
-        expenses = st.session_state.processed_expenses.copy()
-
-    # Apply date filter for display only
+    # Apply date filter first
     df_filtered = filter_by_date(df, date_filter, start_date, end_date)
 
     if df_filtered.empty:
@@ -915,46 +889,166 @@ def main():
     max_date = df_filtered['Date'].max().strftime('%Y-%m-%d')
     st.info(f"Showing transactions from {min_date} to {max_date} ({len(df_filtered)} transactions)")
 
-    # Filter expenses based on date range - ensure expenses have Date column first
-    if 'Date' not in expenses.columns:
+    # Create placeholders for live updates
+    transactions_table_placeholder = st.empty()
+    sankey_chart_placeholder = st.empty()
+
+    # Process full dataset with GPT-5 only if not already done
+    if st.session_state.processed_expenses is None:
+        # Initial processing - apply keyword categorization
+        working_df = df.copy()
+        working_df['Amount'] = pd.to_numeric(working_df['Amount'], errors='coerce')
+        expenses = working_df[working_df['Amount'] < 0].copy()
+        expenses['Amount'] = expenses['Amount'].abs()
+        expenses['Category'] = expenses['Description'].apply(categorize_transaction)
+
+        # Add Date column to expenses
         expenses['Date'] = pd.to_datetime(
             df.loc[expenses.index, 'Transaction Date'] if 'Transaction Date' in df.columns else df.loc[expenses.index, 'Posting Date'],
             errors='coerce'
         )
 
-    # Filter expenses to only include those within the date range
-    expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
+        # Store in session state immediately so date filtering works
+        st.session_state.processed_expenses = expenses.copy()
 
-    # Use the consolidated function to rebuild sankey data from filtered expenses
-    category_totals, sankey_data = create_sankey_from_expenses(expenses_filtered)
+        # Filter expenses for current date range
+        expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
+
+        # Display initial state immediately
+        with transactions_table_placeholder.container():
+            st.write("### All Transactions")
+            st.write(f"Showing {len(expenses_filtered)} expense transactions (categories update live during GPT-5 processing)")
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
+            table_data = table_data.sort_values('Date', ascending=False)
+            st.dataframe(
+                table_data,
+                use_container_width=True,
+                height=400,
+                column_config={
+                    "Date": st.column_config.TextColumn("Date", width="small"),
+                    "Description": st.column_config.TextColumn("Description", width="large"),
+                    "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
+                    "Category": st.column_config.TextColumn("Category", width="medium")
+                }
+            )
+
+        # Display initial Sankey diagram
+        category_totals, sankey_data = create_sankey_from_expenses(expenses_filtered)
+        with sankey_chart_placeholder.container():
+            display_sankey(category_totals, sankey_data, expenses_filtered)
+
+        # Now run GPT-5 categorization in background (only for "Other" transactions)
+        other_transactions = expenses[expenses['Category'] == 'Other']['Description'].unique().tolist()
+        if other_transactions and api_key:
+            # Use streaming mode with automatic chunking
+            def stream_update_callback(updated_expenses, stream_update=None):
+                """Called during streaming to update the display."""
+                # Update session state with new categorizations
+                st.session_state.processed_expenses = updated_expenses.copy()
+
+                # Filter for current date range
+                updated_filtered = updated_expenses[updated_expenses['Date'].isin(df_filtered['Date'])].copy()
+
+                # Update table
+                with transactions_table_placeholder.container():
+                    st.write("### All Transactions")
+                    st.write(f"Showing {len(updated_filtered)} expense transactions (🔴 GPT-5 categorizing...)")
+                    table_data = updated_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+                    table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
+                    table_data = table_data.sort_values('Date', ascending=False)
+                    st.dataframe(
+                        table_data,
+                        use_container_width=True,
+                        height=400,
+                        column_config={
+                            "Date": st.column_config.TextColumn("Date", width="small"),
+                            "Description": st.column_config.TextColumn("Description", width="large"),
+                            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
+                            "Category": st.column_config.TextColumn("Category", width="medium")
+                        }
+                    )
+
+                # Update Sankey
+                updated_totals, updated_sankey = create_sankey_from_expenses(updated_filtered)
+                with sankey_chart_placeholder.container():
+                    display_sankey(updated_totals, updated_sankey, updated_filtered, stream_update=stream_update)
+
+            gpt_categories = categorize_with_gpt5_streaming(
+                other_transactions,
+                api_key,
+                update_callback=stream_update_callback,
+                expenses_df=expenses
+            )
+            # Update categories based on GPT-5 results
+            expenses['Category'] = expenses.apply(
+                lambda row: gpt_categories.get(row['Description'], row['Category'])
+                if row['Category'] == 'Other' else row['Category'],
+                axis=1
+            )
+            # Update session state with final results
+            st.session_state.processed_expenses = expenses.copy()
+
+        # Final update
+        expenses = st.session_state.processed_expenses.copy()
+        expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
+
+        # Final table update
+        with transactions_table_placeholder.container():
+            st.write("### All Transactions")
+            st.write(f"Showing {len(expenses_filtered)} expense transactions ✅")
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
+            table_data = table_data.sort_values('Date', ascending=False)
+            st.dataframe(
+                table_data,
+                use_container_width=True,
+                height=400,
+                column_config={
+                    "Date": st.column_config.TextColumn("Date", width="small"),
+                    "Description": st.column_config.TextColumn("Description", width="large"),
+                    "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
+                    "Category": st.column_config.TextColumn("Category", width="medium")
+                }
+            )
+
+        # Final Sankey update
+        category_totals, sankey_data = create_sankey_from_expenses(expenses_filtered)
+        with sankey_chart_placeholder.container():
+            display_sankey(category_totals, sankey_data, expenses_filtered)
+
+    else:
+        # Use cached processed expenses
+        expenses = st.session_state.processed_expenses.copy()
+        expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
+
+        # Display table (no GPT-5 processing needed)
+        with transactions_table_placeholder.container():
+            st.write("### All Transactions")
+            st.write(f"Showing {len(expenses_filtered)} expense transactions")
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
+            table_data = table_data.sort_values('Date', ascending=False)
+            st.dataframe(
+                table_data,
+                use_container_width=True,
+                height=400,
+                column_config={
+                    "Date": st.column_config.TextColumn("Date", width="small"),
+                    "Description": st.column_config.TextColumn("Description", width="large"),
+                    "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
+                    "Category": st.column_config.TextColumn("Category", width="medium")
+                }
+            )
+
+        # Display Sankey
+        category_totals, sankey_data = create_sankey_from_expenses(expenses_filtered)
+        with sankey_chart_placeholder.container():
+            display_sankey(category_totals, sankey_data, expenses_filtered)
 
     if category_totals.empty:
         st.error("No expenses found in the selected date range.")
         return
-
-    # Display filtered data
-    display_sankey(category_totals, sankey_data, expenses_filtered)
-
-    # Add interactive transaction table view
-    st.write("### All Transactions")
-
-    # Prepare table data with proper columns
-    table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
-    table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
-    table_data = table_data.sort_values('Date', ascending=False)
-
-    # Display interactive dataframe with sorting/filtering
-    st.dataframe(
-        table_data,
-        use_container_width=True,
-        height=400,
-        column_config={
-            "Date": st.column_config.TextColumn("Date", width="small"),
-            "Description": st.column_config.TextColumn("Description", width="large"),
-            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
-            "Category": st.column_config.TextColumn("Category", width="medium")
-        }
-    )
 
     # Add helpful info about multi-layer visualization
     with st.expander("ℹ️ Understanding the Multi-Layer Sankey Diagram"):
