@@ -1,6 +1,11 @@
 venv/
 __pycache__/
-*.CSV
-CLAUDE.md
-efb_categories.db
+
 .env
+
+simple_sankey.db
+
+*.CSV
+
+CLAUDE.md
+.claude/

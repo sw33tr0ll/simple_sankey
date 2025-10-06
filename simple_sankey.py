@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import json
 import sqlite3
@@ -111,8 +111,38 @@ CATEGORY_COLORS = {
 # Default color for custom categories
 DEFAULT_CUSTOM_COLOR = '#A8DADC'
 
+# Categorization prompt for LLM
+CATEGORIZATION_PROMPT = """You are a financial transaction categorizer. For each transaction, provide:
+
+1. **Category**: 1-2 SHORT words maximum (e.g., "Gas Station", "Restaurant", "Groceries", "Gym", "Theater", "Health")
+2. **Parent Category**: ONE WORD, very generic (e.g., "Transport", "Food", "Entertainment", "Fitness", "Professional", "Services", "Financial")
+
+CRITICAL RULES:
+- NEVER use "Other" or "Bills" as category or parent - YOU MUST be specific and creative
+- Keep categories SHORT and DIRECT: Use "Restaurant" not "Japanese Cuisine", "Groceries" not "Supermarket"
+- NO hyphens or extra details: Use "Theater" not "Entertainment - Theater"
+- Parent must be ONE word: "Food", "Entertainment", "Shopping", "Transport", "Health", "Fitness", "Pets", "Professional", "Services", "Financial"
+
+HOW TO HANDLE UNCLEAR TRANSACTIONS:
+- Checks → "Check Payment" / parent: "Financial"
+- ATM/Withdrawals → "Cash Withdrawal" / parent: "Financial"
+- Transfers → "Transfer" / parent: "Financial"
+- PayPal subscriptions → Identify the service (e.g., "Streaming" for Paramount+)
+- Unknown merchants → Use business type (e.g., "Local Service" / "Professional")
+- Moving/Storage → "Moving" or "Storage" / parent: "Services"
+- Vehicle registration → "Registration" / parent: "Transport"
+
+Examples:
+- Whole Foods → category: "Groceries", parent: "Food"
+- Netflix → category: "Streaming", parent: "Entertainment"
+- CHECK 235 → category: "Check Payment", parent: "Financial"
+- Spirit Halloween → category: "Seasonal Store", parent: "Shopping"
+- U-Haul → category: "Moving", parent: "Services"
+- ATM Withdrawal → category: "Cash Withdrawal", parent: "Financial"
+"""
+
 # Database setup
-DB_PATH = os.path.join(os.path.expanduser('.'), 'efb_categories.db')
+DB_PATH = os.path.join(os.path.expanduser('.'), 'simple_sankey.db')
 
 def init_db():
     """Initialize SQLite database for storing custom categories and modifications."""
@@ -132,7 +162,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS category_modifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             description TEXT UNIQUE NOT NULL,
-            category TEXT NOT NULL
+            category TEXT NOT NULL,
+            parent_category TEXT
         )
     ''')
 
@@ -173,27 +204,36 @@ def load_category_modifications():
     """Load all category modifications from database."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT description, category FROM category_modifications')
-    modifications = {row[0]: row[1] for row in cursor.fetchall()}
+
+    # Try to get parent_category, but handle old databases that don't have it
+    try:
+        cursor.execute('SELECT description, category, parent_category FROM category_modifications')
+        modifications = {row[0]: {'category': row[1], 'parent': row[2]} for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        # Old database without parent_category column
+        cursor.execute('SELECT description, category FROM category_modifications')
+        modifications = {row[0]: {'category': row[1], 'parent': None} for row in cursor.fetchall()}
+
     conn.close()
     return modifications
 
-def save_category_modification(description, category):
+def save_category_modification(description, category, parent_category=None):
     """Save a transaction category modification to database."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO category_modifications (description, category)
-        VALUES (?, ?)
-    ''', (description, category))
+        INSERT OR REPLACE INTO category_modifications (description, category, parent_category)
+        VALUES (?, ?, ?)
+    ''', (description, category, parent_category))
     conn.commit()
     conn.close()
 
 class TransactionCategorization(BaseModel):
     model_config = {"extra": "forbid"}
     description: str
-    category: str
-    confidence: float
+    category: str = Field(..., description="Specific category name (e.g., 'Gas', 'Coffee Shops', 'Streaming Services')")
+    parent_category: str = Field(..., description="Broader parent category (e.g., 'Transport', 'Restaurants', 'Entertainment')")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1")
 
 class BatchCategorizationResult(BaseModel):
     model_config = {"extra": "forbid"}
@@ -241,19 +281,29 @@ def validate_category(category):
     return 'Other'
 
 def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=None, expenses_df=None):
-    """Use GPT-5 with streaming output and chunked processing for reliability."""
+    """Use GPT-4.1-nano with streaming output and chunked processing for reliability."""
     if not descriptions_list:
         return {}
 
-    # Determine chunk size - aim for 20-50 transactions per chunk for streaming
-    total = len(descriptions_list)
-    if total <= 50:
-        chunk_size = total  # Don't chunk if 50 or fewer
-    else:
-        chunk_size = max(20, min(50, total // 20))  # 20-50 transactions per chunk
+    # Use small chunks of 3 transactions for better accuracy
+    chunk_size = 3
 
     client = OpenAI(api_key=api_key)
-    categories_str = ', '.join([cat for cat in ALL_CATEGORIES if cat != 'Other'])
+
+    # Collect previously used categories for consistency
+    existing_categories = set()
+    existing_parents = set()
+    if expenses_df is not None and 'Category' in expenses_df.columns:
+        existing_categories = set(expenses_df['Category'].unique()) - {'Other'}
+        if 'Parent_Category' in expenses_df.columns:
+            existing_parents = set(expenses_df['Parent_Category'].unique()) - {'Other'}
+
+    # Build enhanced prompt with existing categories
+    categories_hint = ""
+    if existing_categories:
+        categories_hint = f"\n\nPREVIOUSLY USED CATEGORIES (prefer these for consistency):\n- Categories: {', '.join(sorted(existing_categories))}\n- Parents: {', '.join(sorted(existing_parents))}"
+
+    enhanced_prompt = CATEGORIZATION_PROMPT + categories_hint
 
     # Prepare schema once
     schema = BatchCategorizationResult.model_json_schema()
@@ -270,7 +320,7 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
 
     add_no_additional_properties(schema)
 
-    # Split into chunks
+    # Split into chunks - keep track of descriptions in order
     chunks = [descriptions_list[i:i + chunk_size] for i in range(0, len(descriptions_list), chunk_size)]
 
     # Create expandable section for live categorization
@@ -283,15 +333,18 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
     update_counter = 0
 
     for chunk_idx, chunk in enumerate(chunks):
+        # Create transaction text with numbered list
         transactions_text = '\n'.join([f"{i+1}. {desc}" for i, desc in enumerate(chunk)])
+        # Keep mapping of what we sent to the LLM
+        chunk_descriptions = list(chunk)
 
         # Show chunk progress
         status_placeholder.info(f"⏳ Processing chunk {chunk_idx + 1}/{len(chunks)} ({len(chunk)} transactions)...")
 
         try:
             stream = client.responses.create(
-                model="gpt-5",
-                instructions=f"You are a financial transaction categorizer. Categorize each transaction into one of these categories: {categories_str}. Provide a confidence score between 0 and 1 for each.",
+                model="gpt-4.1-nano",
+                instructions=enhanced_prompt,
                 input=f"Categorize these {len(chunk)} transactions:\n\n{transactions_text}",
                 text={
                     "format": {
@@ -325,17 +378,54 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
                                 partial_json = json.loads(full_text)
                                 if 'transactions' in partial_json:
                                     # Check for new transactions that were just added
+                                    # Match by position in the list (more reliable than string matching)
                                     new_transactions = {}
-                                    for t in partial_json['transactions']:
-                                        desc = t['description']
-                                        cat = validate_category(t['category'])  # Validate category
-                                        if desc not in chunk_results:
+                                    new_parents = {}
+                                    for idx, t in enumerate(partial_json['transactions']):
+                                        if idx >= len(chunk_descriptions):
+                                            break  # LLM returned more than expected
+
+                                        actual_desc = chunk_descriptions[idx]  # The real description from our data
+                                        cat = t['category']  # Use LLM's category directly
+                                        parent_cat = t.get('parent_category', cat)
+
+                                        # Reject "Other" categorizations - force something better
+                                        if cat == 'Other':
+                                            st.warning(f"⚠️ AI returned 'Other' - using fallback: {actual_desc[:30]}...")
+                                            # Provide a better default based on description keywords
+                                            desc_lower = actual_desc.lower()
+                                            if 'check' in desc_lower:
+                                                cat = 'Check Payment'
+                                                parent_cat = 'Financial'
+                                            elif 'transfer' in desc_lower or 'ach' in desc_lower:
+                                                cat = 'Transfer'
+                                                parent_cat = 'Financial'
+                                            elif 'atm' in desc_lower or 'withdrawal' in desc_lower:
+                                                cat = 'Cash Withdrawal'
+                                                parent_cat = 'Financial'
+                                            elif 'paypal' in desc_lower:
+                                                cat = 'Online Payment'
+                                                parent_cat = 'Financial'
+                                            else:
+                                                cat = 'Uncategorized'
+                                                parent_cat = 'Services'
+
+                                        # Also fix "Other" parents
+                                        if parent_cat == 'Other':
+                                            parent_cat = cat  # Make it top-level
+
+                                        if actual_desc not in chunk_results:
                                             # This is a new categorization
-                                            new_transactions[desc] = cat
-                                            chunk_results[desc] = cat
+                                            new_transactions[actual_desc] = cat
+                                            new_parents[actual_desc] = parent_cat
+                                            chunk_results[actual_desc] = cat
+
+                                            # Update hierarchy dynamically if we have a parent
+                                            if parent_cat and parent_cat != cat and cat not in CATEGORY_HIERARCHY:
+                                                CATEGORY_HIERARCHY[cat] = parent_cat
 
                                             # Save to database immediately
-                                            save_category_modification(desc, cat)
+                                            save_category_modification(actual_desc, cat, parent_cat)
 
                                     # Show categorized transactions if we have new ones
                                     if new_transactions:
@@ -346,8 +436,9 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
 
                                         # Update expenses dataframe with new categorizations
                                         if update_callback and expenses_df is not None:
-                                            for desc, cat in new_transactions.items():
-                                                expenses_df.loc[expenses_df['Description'] == desc, 'Category'] = cat
+                                            for actual_desc, cat in new_transactions.items():
+                                                expenses_df.loc[expenses_df['Description'] == actual_desc, 'Category'] = cat
+                                                expenses_df.loc[expenses_df['Description'] == actual_desc, 'Parent_Category'] = new_parents[actual_desc]
                                             update_counter += 1
                                             update_callback(expenses_df.copy(), stream_update=update_counter)
                             except json.JSONDecodeError:
@@ -359,10 +450,65 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
                         if hasattr(event, 'text'):
                             full_text = event.text
 
-            # Parse final results for this chunk
+            # Parse final results for this chunk - match by position
             output_json = json.loads(full_text)
-            chunk_results = {t['description']: validate_category(t['category']) for t in output_json['transactions']}
+            chunk_parents = {}
+            for idx, t in enumerate(output_json['transactions']):
+                if idx >= len(chunk_descriptions):
+                    break  # LLM returned more than expected
+
+                actual_desc = chunk_descriptions[idx]  # The real description from our data
+                cat = t['category']
+                parent_cat = t.get('parent_category', cat)
+
+                # Reject "Other" categorizations - apply same fallback logic
+                if cat == 'Other':
+                    desc_lower = actual_desc.lower()
+                    if 'check' in desc_lower:
+                        cat = 'Check Payment'
+                        parent_cat = 'Financial'
+                    elif 'transfer' in desc_lower or 'ach' in desc_lower:
+                        cat = 'Transfer'
+                        parent_cat = 'Financial'
+                    elif 'atm' in desc_lower or 'withdrawal' in desc_lower:
+                        cat = 'Cash Withdrawal'
+                        parent_cat = 'Financial'
+                    elif 'paypal' in desc_lower:
+                        cat = 'Online Payment'
+                        parent_cat = 'Financial'
+                    else:
+                        cat = 'Uncategorized'
+                        parent_cat = 'Services'
+
+                # Fix "Other" parents
+                if parent_cat == 'Other':
+                    parent_cat = cat
+
+                chunk_results[actual_desc] = cat
+                chunk_parents[actual_desc] = parent_cat
+
+                # Update hierarchy dynamically
+                if parent_cat and parent_cat != cat and cat not in CATEGORY_HIERARCHY:
+                    CATEGORY_HIERARCHY[cat] = parent_cat
+
             all_results.update(chunk_results)
+
+            # Update expenses_df with final chunk results
+            if update_callback and expenses_df is not None:
+                for desc, cat in chunk_results.items():
+                    expenses_df.loc[expenses_df['Description'] == desc, 'Category'] = cat
+                    expenses_df.loc[expenses_df['Description'] == desc, 'Parent_Category'] = chunk_parents[desc]
+                    # Update running sets for next chunks
+                    existing_categories.add(cat)
+                    existing_parents.add(chunk_parents[desc])
+
+                # Rebuild hint for next chunk
+                if existing_categories:
+                    categories_hint = f"\n\nPREVIOUSLY USED CATEGORIES (prefer these for consistency):\n- Categories: {', '.join(sorted(existing_categories))}\n- Parents: {', '.join(sorted(existing_parents))}"
+                    enhanced_prompt = CATEGORIZATION_PROMPT + categories_hint
+
+                update_counter += 1
+                update_callback(expenses_df.copy(), stream_update=update_counter)
 
             # Update progress bar
             progress_bar.progress((chunk_idx + 1) / len(chunks))
@@ -384,20 +530,14 @@ def categorize_with_gpt5_streaming(descriptions_list, api_key, update_callback=N
     return all_results
 
 def categorize_with_gpt5_chunked(descriptions_list, api_key, update_callback=None, expenses_df=None):
-    """Use GPT-5 with chunked requests (multiple smaller batches)."""
+    """Use GPT-4.1-nano with chunked requests (multiple smaller batches)."""
     if not descriptions_list:
         return {}
 
-    # Determine chunk size based on total transactions
-    total = len(descriptions_list)
-    if total <= 10:
-        chunk_size = max(1, total)  # Don't chunk if 10 or fewer
-    else:
-        # Aim for 10-20 requests max
-        chunk_size = max(1, total // 15)
+    # Use small chunks of 3 transactions for better accuracy
+    chunk_size = 3
 
     client = OpenAI(api_key=api_key)
-    categories_str = ', '.join([cat for cat in ALL_CATEGORIES if cat != 'Other'])
 
     # Prepare schema
     schema = BatchCategorizationResult.model_json_schema()
@@ -425,11 +565,12 @@ def categorize_with_gpt5_chunked(descriptions_list, api_key, update_callback=Non
         status_text.info(f"🤖 Processing chunk {idx + 1}/{len(chunks)} ({len(chunk)} transactions)...")
 
         transactions_text = '\n'.join([f"{i+1}. {desc}" for i, desc in enumerate(chunk)])
+        chunk_descriptions = list(chunk)  # Keep original descriptions
 
         try:
             response = client.responses.create(
-                model="gpt-5",
-                instructions=f"You are a financial transaction categorizer. Categorize each transaction into one of these categories: {categories_str}. Provide a confidence score between 0 and 1 for each.",
+                model="gpt-4.1-nano",
+                instructions=CATEGORIZATION_PROMPT,
                 input=f"Categorize these {len(chunk)} transactions:\n\n{transactions_text}",
                 text={
                     "format": {
@@ -442,8 +583,19 @@ def categorize_with_gpt5_chunked(descriptions_list, api_key, update_callback=Non
             )
 
             output_json = json.loads(response.output_text)
-            chunk_results = {t['description']: validate_category(t['category']) for t in output_json['transactions']}
-            results.update(chunk_results)
+            for t_idx, t in enumerate(output_json['transactions']):
+                if t_idx >= len(chunk_descriptions):
+                    break
+
+                actual_desc = chunk_descriptions[t_idx]  # Match by position
+                cat = t['category']
+                parent_cat = t.get('parent_category', cat)
+
+                results[actual_desc] = cat
+
+                # Update hierarchy dynamically
+                if parent_cat and parent_cat != cat and cat not in CATEGORY_HIERARCHY:
+                    CATEGORY_HIERARCHY[cat] = parent_cat
 
             # Update display after each chunk if callback provided
             if update_callback and expenses_df is not None:
@@ -614,7 +766,7 @@ def prepare_sankey_data(df, use_gpt5=False, api_key=None, display_callback=None,
         initial_totals, initial_sankey = create_sankey_data(expenses)
         display_callback(initial_totals, initial_sankey, expenses)
 
-    # Use GPT-5 to categorize "Other" transactions
+    # Use GPT-4.1-nano to categorize "Other" transactions
     if use_gpt5 and api_key:
         other_transactions = expenses[expenses['Category'] == 'Other']['Description'].unique().tolist()
         if other_transactions:
@@ -648,7 +800,7 @@ def main():
     # Initialize database
     init_db()
 
-    # GPT-5 API Key
+    # OpenAI API Key
     api_key = os.environ.get('OPENAI_API_KEY')
 
     # Load custom categories from database
@@ -678,6 +830,9 @@ def main():
                     delete_custom_category(cat)
                     st.session_state.custom_categories = load_custom_categories()
                     st.rerun()
+
+    # Debug mode
+    st.session_state.show_debug = st.sidebar.checkbox("🔍 Show Debug Info", value=False)
 
     # Date filtering
     st.sidebar.header("Date Filter")
@@ -736,13 +891,36 @@ def main():
             r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
             return f'rgba({r},{g},{b},{alpha})'
 
+        # Build a complete hierarchy map from both CATEGORY_HIERARCHY and Parent_Category column
+        hierarchy_map = dict(CATEGORY_HIERARCHY)  # Start with hardcoded hierarchy
+
+        # Add AI-generated parent relationships from the dataframe
+        if 'Parent_Category' in expenses_df.columns:
+            for _, row in expenses_df.iterrows():
+                cat = row['Category']
+                parent = row.get('Parent_Category')
+                # Skip invalid parents: Other, same as category, or empty
+                if parent and parent != cat and parent not in ['Other', ''] and cat not in hierarchy_map:
+                    hierarchy_map[cat] = parent
+
+        # Debug: show unique category→parent mappings
+        if st.session_state.get('show_debug'):
+            with st.expander("🔍 Category Hierarchy Debug"):
+                unique_mappings = expenses_df[['Category', 'Parent_Category']].drop_duplicates().sort_values('Category')
+                st.write("**Category → Parent mappings in data:**")
+                st.dataframe(unique_mappings)
+
         def get_ancestry_chain(category):
             """Get the full chain of parents for a category (from root to category)."""
             chain = [category]
             current = category
-            while current in CATEGORY_HIERARCHY:
-                parent = CATEGORY_HIERARCHY[current]
+            seen = set([category])  # Prevent infinite loops
+            while current in hierarchy_map:
+                parent = hierarchy_map[current]
+                if parent in seen:  # Circular reference, stop
+                    break
                 chain.insert(0, parent)
+                seen.add(parent)
                 current = parent
             return chain
 
@@ -827,8 +1005,19 @@ def main():
         """Display or update the Sankey diagram."""
         # Apply any existing modifications and rebuild
         if st.session_state.category_modifications:
-            for desc, new_cat in st.session_state.category_modifications.items():
+            for desc, mod_data in st.session_state.category_modifications.items():
+                # Handle both old format (string) and new format (dict)
+                if isinstance(mod_data, dict):
+                    new_cat = mod_data['category']
+                    parent = mod_data.get('parent') or CATEGORY_HIERARCHY.get(new_cat, new_cat)
+                else:
+                    # Old format: just a category string
+                    new_cat = mod_data
+                    parent = CATEGORY_HIERARCHY.get(new_cat, new_cat)
+
                 expenses.loc[expenses['Description'] == desc, 'Category'] = new_cat
+                if 'Parent_Category' in expenses.columns:
+                    expenses.loc[expenses['Description'] == desc, 'Parent_Category'] = parent
 
             # Rebuild using consolidated function
             category_totals, sankey_data = create_sankey_from_expenses(expenses)
@@ -870,7 +1059,7 @@ def main():
 
         # Use stream_update counter for unique keys during streaming, otherwise use id
         chart_key = f"sankey_stream_{stream_update}" if stream_update is not None else f"sankey_{id(category_totals)}"
-        st.plotly_chart(fig, use_container_width=True, key=chart_key)
+        st.plotly_chart(fig, width='stretch', key=chart_key)
 
         # Display category summary
         st.write("### Spending by Category")
@@ -893,7 +1082,7 @@ def main():
     transactions_table_placeholder = st.empty()
     sankey_chart_placeholder = st.empty()
 
-    # Process full dataset with GPT-5 only if not already done
+    # Process full dataset with GPT-4.1-nano only if not already done
     if st.session_state.processed_expenses is None:
         # Initial processing - apply keyword categorization
         working_df = df.copy()
@@ -901,6 +1090,22 @@ def main():
         expenses = working_df[working_df['Amount'] < 0].copy()
         expenses['Amount'] = expenses['Amount'].abs()
         expenses['Category'] = expenses['Description'].apply(categorize_transaction)
+        expenses['Parent_Category'] = 'Other'  # Will be updated by AI
+
+        # Apply existing categorizations from database to skip AI re-processing
+        for desc, mod_data in st.session_state.category_modifications.items():
+            if isinstance(mod_data, dict):
+                cat = mod_data['category']
+                parent = mod_data.get('parent') or CATEGORY_HIERARCHY.get(cat, cat)
+            else:
+                cat = mod_data
+                parent = CATEGORY_HIERARCHY.get(cat, cat)
+
+            # Update if this description exists in current expenses
+            mask = expenses['Description'] == desc
+            if mask.any():
+                expenses.loc[mask, 'Category'] = cat
+                expenses.loc[mask, 'Parent_Category'] = parent
 
         # Add Date column to expenses
         expenses['Date'] = pd.to_datetime(
@@ -917,19 +1122,20 @@ def main():
         # Display initial state immediately
         with transactions_table_placeholder.container():
             st.write("### All Transactions")
-            st.write(f"Showing {len(expenses_filtered)} expense transactions (categories update live during GPT-5 processing)")
-            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            st.write(f"Showing {len(expenses_filtered)} expense transactions (categories update live during GPT-4.1-nano processing)")
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category', 'Parent_Category']].copy()
             table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
             table_data = table_data.sort_values('Date', ascending=False)
             st.dataframe(
                 table_data,
-                use_container_width=True,
+                width='stretch',
                 height=400,
                 column_config={
                     "Date": st.column_config.TextColumn("Date", width="small"),
                     "Description": st.column_config.TextColumn("Description", width="large"),
                     "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
-                    "Category": st.column_config.TextColumn("Category", width="medium")
+                    "Category": st.column_config.TextColumn("Category", width="medium"),
+                    "Parent_Category": st.column_config.TextColumn("Parent", width="small")
                 }
             )
 
@@ -938,77 +1144,91 @@ def main():
         with sankey_chart_placeholder.container():
             display_sankey(category_totals, sankey_data, expenses_filtered)
 
-        # Now run GPT-5 categorization in background (only for "Other" transactions)
-        other_transactions = expenses[expenses['Category'] == 'Other']['Description'].unique().tolist()
-        if other_transactions and api_key:
+        # Now run GPT-4.1-nano categorization on uncategorized transactions only
+        # Get transactions that aren't already in the database
+        uncategorized_mask = ~expenses['Description'].isin(st.session_state.category_modifications.keys())
+        uncategorized_transactions = expenses.loc[uncategorized_mask, 'Description'].unique().tolist()
+
+        if uncategorized_transactions and api_key:
+            st.info(f"🤖 Running AI categorization on {len(uncategorized_transactions)} new transactions ({len(st.session_state.category_modifications)} already in database)")
+
             # Use streaming mode with automatic chunking
             def stream_update_callback(updated_expenses, stream_update=None):
                 """Called during streaming to update the display."""
-                # Update session state with new categorizations
-                st.session_state.processed_expenses = updated_expenses.copy()
+                try:
+                    # Update session state with new categorizations
+                    st.session_state.processed_expenses = updated_expenses.copy()
 
-                # Filter for current date range
-                updated_filtered = updated_expenses[updated_expenses['Date'].isin(df_filtered['Date'])].copy()
+                    # Filter for current date range
+                    updated_filtered = updated_expenses[updated_expenses['Date'].isin(df_filtered['Date'])].copy()
 
-                # Update table
-                with transactions_table_placeholder.container():
-                    st.write("### All Transactions")
-                    st.write(f"Showing {len(updated_filtered)} expense transactions (🔴 GPT-5 categorizing...)")
-                    table_data = updated_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
-                    table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
-                    table_data = table_data.sort_values('Date', ascending=False)
-                    st.dataframe(
-                        table_data,
-                        use_container_width=True,
-                        height=400,
-                        column_config={
-                            "Date": st.column_config.TextColumn("Date", width="small"),
-                            "Description": st.column_config.TextColumn("Description", width="large"),
-                            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
-                            "Category": st.column_config.TextColumn("Category", width="medium")
-                        }
-                    )
+                    # Update table
+                    with transactions_table_placeholder.container():
+                        st.write("### All Transactions")
+                        st.write(f"Showing {len(updated_filtered)} expense transactions (🔴 GPT-4.1-nano categorizing...)")
+                        table_data = updated_filtered[['Date', 'Description', 'Amount', 'Category', 'Parent_Category']].copy()
+                        table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
+                        table_data = table_data.sort_values('Date', ascending=False)
+                        st.dataframe(
+                            table_data,
+                            width='stretch',
+                            height=400,
+                            column_config={
+                                "Date": st.column_config.TextColumn("Date", width="small"),
+                                "Description": st.column_config.TextColumn("Description", width="large"),
+                                "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
+                                "Category": st.column_config.TextColumn("Category", width="medium"),
+                                "Parent_Category": st.column_config.TextColumn("Parent", width="small")
+                            }
+                        )
 
-                # Update Sankey
-                updated_totals, updated_sankey = create_sankey_from_expenses(updated_filtered)
-                with sankey_chart_placeholder.container():
-                    display_sankey(updated_totals, updated_sankey, updated_filtered, stream_update=stream_update)
+                    # Update Sankey
+                    updated_totals, updated_sankey = create_sankey_from_expenses(updated_filtered)
+                    with sankey_chart_placeholder.container():
+                        display_sankey(updated_totals, updated_sankey, updated_filtered, stream_update=stream_update)
+                except Exception as e:
+                    st.error(f"Error in stream_update_callback: {str(e)}")
 
-            gpt_categories = categorize_with_gpt5_streaming(
-                other_transactions,
+            # Streaming function updates expenses in place and session state via callbacks
+            categorize_with_gpt5_streaming(
+                uncategorized_transactions,
                 api_key,
                 update_callback=stream_update_callback,
                 expenses_df=expenses
             )
-            # Update categories based on GPT-5 results
-            expenses['Category'] = expenses.apply(
-                lambda row: gpt_categories.get(row['Description'], row['Category'])
-                if row['Category'] == 'Other' else row['Category'],
-                axis=1
-            )
-            # Update session state with final results
+            # Session state already updated via callbacks during streaming
+            # Just ensure it's saved one final time
             st.session_state.processed_expenses = expenses.copy()
+        else:
+            # All transactions already categorized from database
+            st.success(f"✅ All {len(expenses['Description'].unique())} unique transactions already categorized from database!")
 
         # Final update
         expenses = st.session_state.processed_expenses.copy()
+
+        # Ensure Parent_Category column exists (for backward compatibility)
+        if 'Parent_Category' not in expenses.columns:
+            expenses['Parent_Category'] = 'Other'
+
         expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
 
         # Final table update
         with transactions_table_placeholder.container():
             st.write("### All Transactions")
             st.write(f"Showing {len(expenses_filtered)} expense transactions ✅")
-            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category', 'Parent_Category']].copy()
             table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
             table_data = table_data.sort_values('Date', ascending=False)
             st.dataframe(
                 table_data,
-                use_container_width=True,
+                width='stretch',
                 height=400,
                 column_config={
                     "Date": st.column_config.TextColumn("Date", width="small"),
                     "Description": st.column_config.TextColumn("Description", width="large"),
                     "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
-                    "Category": st.column_config.TextColumn("Category", width="medium")
+                    "Category": st.column_config.TextColumn("Category", width="medium"),
+                    "Parent_Category": st.column_config.TextColumn("Parent", width="small")
                 }
             )
 
@@ -1020,24 +1240,30 @@ def main():
     else:
         # Use cached processed expenses
         expenses = st.session_state.processed_expenses.copy()
+
+        # Ensure Parent_Category column exists (for backward compatibility)
+        if 'Parent_Category' not in expenses.columns:
+            expenses['Parent_Category'] = 'Other'
+
         expenses_filtered = expenses[expenses['Date'].isin(df_filtered['Date'])].copy()
 
         # Display table (no GPT-5 processing needed)
         with transactions_table_placeholder.container():
             st.write("### All Transactions")
             st.write(f"Showing {len(expenses_filtered)} expense transactions")
-            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category']].copy()
+            table_data = expenses_filtered[['Date', 'Description', 'Amount', 'Category', 'Parent_Category']].copy()
             table_data['Date'] = table_data['Date'].dt.strftime('%Y-%m-%d')
             table_data = table_data.sort_values('Date', ascending=False)
             st.dataframe(
                 table_data,
-                use_container_width=True,
+                width='stretch',
                 height=400,
                 column_config={
                     "Date": st.column_config.TextColumn("Date", width="small"),
                     "Description": st.column_config.TextColumn("Description", width="large"),
                     "Amount": st.column_config.NumberColumn("Amount", format="$%.2f", width="small"),
-                    "Category": st.column_config.TextColumn("Category", width="medium")
+                    "Category": st.column_config.TextColumn("Category", width="medium"),
+                    "Parent_Category": st.column_config.TextColumn("Parent", width="small")
                 }
             )
 
@@ -1069,8 +1295,12 @@ def main():
 
     st.write("### Transactions by Category")
 
-    # Get list of all categories for dropdown (built-in + subcategories + custom)
-    available_categories = ALL_CATEGORIES + st.session_state.custom_categories
+    # Get list of all categories for dropdown (built-in + subcategories + custom + LLM-generated)
+    available_categories = sorted(set(
+        list(ALL_CATEGORIES) +
+        st.session_state.custom_categories +
+        expenses_filtered['Category'].unique().tolist()
+    ))
 
     for _, row in category_totals.iterrows():
         category = row['Category']
@@ -1095,17 +1325,27 @@ def main():
                     else:
                         st.write("-")
                 with col4:
+                    # Safely get index, defaulting to 0 if category not found
+                    try:
+                        default_index = available_categories.index(category)
+                    except ValueError:
+                        default_index = 0
+
                     new_category = st.selectbox(
                         "Category",
                         available_categories,
-                        index=available_categories.index(category),
+                        index=default_index,
                         key=f"recategorize_{idx}",
                         label_visibility="collapsed"
                     )
                     if new_category != category:
+                        # Get parent from hierarchy
+                        parent = CATEGORY_HIERARCHY.get(new_category, new_category)
                         # Save to database and session state
-                        save_category_modification(tx['Description'], new_category)
-                        st.session_state.category_modifications[tx['Description']] = new_category
+                        save_category_modification(tx['Description'], new_category, parent)
+                        st.session_state.category_modifications[tx['Description']] = {'category': new_category, 'parent': parent}
+                        # Clear processed expenses to force reload with new categories
+                        st.session_state.processed_expenses = None
                         st.rerun()
 
 
